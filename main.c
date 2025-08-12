@@ -1,84 +1,126 @@
 #include <libdragon.h>
-#include <stdio.h>
+#include <stdio.h>      /* asset_fopen / fread / fclose */
 #include <stdint.h>
-#include <stdlib.h>
-#include <malloc.h>
 #include <stdbool.h>
 #include <system.h>
-#include <string.h>
 #include <wav64.h>
+#include <math.h>       /* powf, fabsf */
+#include <malloc.h>     /* mallinfo() - używane do odczytu zużycia sterty */
 
-#define ANALOG_DEADZONE 8
+/* ========================================================================
+ * 0) Ustawienia ogólne
+ * ========================================================================
+ * 0.1) Parametry globalne i makra konfiguracyjne używane w całym programie.
+ */
+#define ANALOG_DEADZONE 8                /* martwa strefa analogów */
+#define ARENA_SIZE      (128 * 1024)     /* arena 128KB */
 
-/* [1] Globalne zmienne i cache kolorów / stany wydajności ------------------- */
-static uint32_t last_frame_ticks = 0; /* [1] Licznik ticków poprzedniej klatki (FPS). */
-static uint32_t fps = 0;              /* [1] Ostatnio policzone FPS. */
-static size_t mem_used = 0;           /* [1] Przybliżone użycie pamięci śledzone przez tracker. */
+/* --------------------------------------------------------------
+ * Ustawienia wygładzania — dopasować do gustu
+ * --------------------------------------------------------------
+ * 0.2) Parametry do wygładzania (EMA / half-life) i progi zmian.
+ */
+#define CPU_AVG_SAMPLES 60               /* bufor uśredniania CPU (liczba próbek) */
+#define FRAME_MS_ALPHA  0.02f            /* EMA dla czasu klatki — mniejsza = wolniejsze reagowanie */
+#define VU_HALF_LIFE_MS 800.0f           /* half-life dla miernika VU (ms) — większe = wolniejsze zanikanie */
 
-float volume = 1.0f;                  /* [1] Głośność (0.0 .. 1.0) */
-char message[128] = "";               /* [1] Obecny komunikat do wyświetlenia */
-int message_timer = 0;                /* [1] Licznik ramek pozostałych do wyświetlenia komunikatu */
+/* minimalne progi, aby uniknąć drobnych zmian (zapobiega "skakaniu") */
+#define FRAME_MS_DISPLAY_THRESHOLD 0.15f /* ms — minimalna zmiana, aby zaktualizować widoczny wynik */
+#define VU_MIN_DELTA 2.0f                /* minimalna różnica VU aby wymusić zamalowanie */
 
-/* [2] Pokazuje komunikat - ustawia timer w klatkach (60 FPS => 60 => 1s) ---- */
-void show_message(const char *text) {
-    if (!text) return;
-    strncpy(message, text, sizeof(message));
-    message[sizeof(message)-1] = '\0';
-    message_timer = 120; /* ~2 sekundy przy 60 FPS; przy wait_ms=33 -> ~4s */
+/* ========================================================================
+ * 0.3) Deklaracje globalne (stan programu, pola wygładzone)
+ * ========================================================================
+ *  - Zmienne globalne służą do przechowywania stanu UI / audio / pomiarów.
+ */
+static uint32_t last_frame_ticks = 0;   /* surowy licznik do obliczania FPS */
+static uint32_t fps = 0;                /* surowe FPS (ostatnie obliczenie) */
+static float volume = 1.0f;             /* bieżąca głośność */
+static char message[128] = "";          /* komunikat HUD */
+static int message_timer = 0;           /* licznik wyświetlania komunikatu */
+
+static float last_frame_start_ms = 0.0f; /* start poprzedniej klatki (ms) */
+static float last_cpu_ms_display = 0.0f; /* wyświetlany (wygładzony) czas klatki */
+static float smoothed_frame_ms = 0.0f;   /* EMA czasu klatki */
+static float smoothed_fps = 0.0f;        /* wygładzony FPS (EMA) */
+static float smoothed_vu_l = 0.0f;       /* wygładzony poziom L (float) */
+static float smoothed_vu_r = 0.0f;       /* wygładzony poziom R (float) */
+
+/* ========================================================================
+ * 1) Alokator "arena" (bump allocator)
+ * ========================================================================
+ * Opis:
+ *  1.1) Szybki prosty alokator pracujący w obrębie statycznej tablicy.
+ *  1.2) Przeznaczenie: małe, krótkotrwałe buforowanie bez konieczności free().
+ *  1.3) Uwaga: zwrócone wskaźniki stają się nieważne po wywołaniu arena_reset().
+ */
+static uint8_t arena_buf[ARENA_SIZE];
+static size_t arena_offset = 0;
+static size_t mem_used = 0; /* raport wykorzystania (arena) */
+
+static inline void arena_reset(void) {
+    /* 1.4) Resetuje wskaźnik alokacji i licznik użycia (cała arena do ponownego użycia). */
+    arena_offset = 0;
+    mem_used = 0;
 }
 
-/* [3] Prosty tracker alokacji (przydatny do debugowania pamięci) ------------ */
-typedef struct MemTrack {
-    void *ptr;
-    size_t size;
-    struct MemTrack *next;
-} MemTrack;
-
-static MemTrack *mem_list = NULL;
-
-static void memtrack_add(void *ptr, size_t size) {
-    if (!ptr || size == 0) return;
-    MemTrack *node = (MemTrack *)malloc(sizeof(MemTrack));
-    if (!node) return;
-    node->ptr  = ptr;
-    node->size = size;
-    node->next = mem_list;
-    mem_list = node;
-}
-
-static size_t memtrack_remove(void *ptr) {
-    if (!ptr) return 0;
-    MemTrack **pp = &mem_list;
-    while (*pp) {
-        if ((*pp)->ptr == ptr) {
-            MemTrack *to_free = *pp;
-            size_t size = to_free->size;
-            *pp = to_free->next;
-            free(to_free);
-            return size;
-        }
-        pp = &((*pp)->next);
-    }
-    return 0;
-}
-
-void *track_malloc(size_t size) {
+static void *arena_alloc(size_t size) {
+    /* 1.5) Alokacja z wyrównaniem do 8 bajtów. Zwraca NULL gdy brak miejsca. */
     if (size == 0) return NULL;
-    void *p = malloc(size);
-    if (!p) return NULL;
+    const size_t align = 8;
+    size_t off = (arena_offset + (align - 1)) & ~(align - 1);
+    if (off + size > ARENA_SIZE) return NULL;
+    void *p = &arena_buf[off];
+    arena_offset = off + size;
     mem_used += size;
-    memtrack_add(p, size);
     return p;
 }
 
-void track_free(void *ptr) {
-    if (!ptr) return;
-    size_t size = memtrack_remove(ptr);
-    if (size > 0 && mem_used >= size) mem_used -= size;
-    free(ptr);
+/* ========================================================================
+ * 2) Bufor uśredniania zużycia procesora
+ * ========================================================================
+ * 2.1) Circular buffer przechowujący ostatnie CPU_AVG_SAMPLES próbek.
+ * 2.2) Umożliwia uzyskanie wygładzonego (średniego) wykorzystania CPU.
+ */
+static float cpu_usage_samples[CPU_AVG_SAMPLES];
+static int cpu_sample_index = 0;
+static int cpu_sample_count = 0;
+
+static void cpu_usage_add_sample(float usage) {
+    /* 2.3) Dodaje nową próbkę do bufora, nadpisując najstarszą. */
+    cpu_usage_samples[cpu_sample_index] = usage;
+    cpu_sample_index = (cpu_sample_index + 1) % CPU_AVG_SAMPLES;
+    if (cpu_sample_count < CPU_AVG_SAMPLES) cpu_sample_count++;
 }
 
-/* [4] Funkcje narzędziowe (strlen, strcpy_s, formaty liczb) ----------------- */
+static float cpu_usage_get_avg(void) {
+    /* 2.4) Zwraca średnią z aktualnych próbek (0 gdy brak próbek). */
+    if (cpu_sample_count == 0) return 0.0f;
+    float sum = 0.0f;
+    for (int i = 0; i < cpu_sample_count; i++) sum += cpu_usage_samples[i];
+    return sum / cpu_sample_count;
+}
+
+/* ========================================================================
+ * 3) Minimalne funkcje pamięciowe/tekstowe (zamiast string.h/memcpy)
+ * ========================================================================
+ * 3.1) Małe, szybkie implementacje memset/memcpy/strlen/strcpy_s stosowane
+ *      aby uniknąć zależności lub mieć kontrolę nad zachowaniem wbudowanych
+ *      funkcji.
+ */
+static inline void *fast_memset(void *dst, int val, size_t n) {
+    unsigned char *p = (unsigned char *)dst;
+    while (n--) *p++ = (unsigned char)val;
+    return dst;
+}
+
+static inline void *fast_memcpy(void *dst, const void *src, size_t n) {
+    unsigned char *d = (unsigned char *)dst;
+    const unsigned char *s = (const unsigned char *)src;
+    while (n--) *d++ = *s++;
+    return dst;
+}
+
 static inline int tiny_strlen(const char *s) {
     if (!s) return 0;
     int l = 0;
@@ -94,6 +136,12 @@ static inline void strcpy_s(char *dst, int n, const char *src) {
     dst[i] = '\0';
 }
 
+/* ========================================================================
+ * 4) Konwersje liczb na tekst
+ * ========================================================================
+ * 4.1) Funkcje zamieniające int/uint/float na ASCII bez użycia sprintf
+ *      (często cięższe i wolniejsze na małych platformach).
+ */
 static int int_to_dec(char *out, int val) {
     char tmp[12];
     int pos = 0;
@@ -127,6 +175,11 @@ static int append_uint_zero_pad(char *dst, unsigned int val, int width) {
     return idx;
 }
 
+/* ========================================================================
+ * 5) Pomocnik: bajt -> hex + spacja
+ * ========================================================================
+ * 5.1) Zamienia jeden bajt na 2 znaki hex + spację (np. "7F ").
+ */
 static inline void u8_to_hex_sp(char *out, uint8_t v) {
     static const char hex[] = "0123456789ABCDEF";
     out[0] = hex[(v >> 4) & 0xF];
@@ -134,29 +187,102 @@ static inline void u8_to_hex_sp(char *out, uint8_t v) {
     out[2] = ' ';
 }
 
-/* [5] Wejście / obsługa przycisków oraz formatowanie analogów ------------- */
-void update_last_button_pressed_optimized(char *buf, size_t size, joypad_inputs_t inputs) {
-    if (inputs.btn.a) strcpy_s(buf, (int)size, "A");
-    else if (inputs.btn.b) strcpy_s(buf, (int)size, "B");
-    else if (inputs.btn.z) strcpy_s(buf, (int)size, "Z");
-    else if (inputs.btn.start) strcpy_s(buf, (int)size, "START");
-    else if (inputs.btn.l) strcpy_s(buf, (int)size, "L");
-    else if (inputs.btn.r) strcpy_s(buf, (int)size, "R");
-    else if (inputs.btn.d_up) strcpy_s(buf, (int)size, "UP");
-    else if (inputs.btn.d_down) strcpy_s(buf, (int)size, "DOWN");
-    else if (inputs.btn.d_left) strcpy_s(buf, (int)size, "LEFT");
-    else if (inputs.btn.d_right) strcpy_s(buf, (int)size, "RIGHT");
-    else if (inputs.btn.c_up) strcpy_s(buf, (int)size, "C-UP");
-    else if (inputs.btn.c_down) strcpy_s(buf, (int)size, "C-DOWN");
-    else if (inputs.btn.c_left) strcpy_s(buf, (int)size, "C-LEFT");
-    else if (inputs.btn.c_right) strcpy_s(buf, (int)size, "C-RIGHT");
-    else if (inputs.stick_x > ANALOG_DEADZONE) strcpy_s(buf, (int)size, "ANALOG-RIGHT");
-    else if (inputs.stick_x < -ANALOG_DEADZONE) strcpy_s(buf, (int)size, "ANALOG-LEFT");
-    else if (inputs.stick_y > ANALOG_DEADZONE) strcpy_s(buf, (int)size, "ANALOG-UP");
-    else if (inputs.stick_y < -ANALOG_DEADZONE) strcpy_s(buf, (int)size, "ANALOG-DOWN");
-    else strcpy_s(buf, (int)size, "Brak");
+/* ========================================================================
+ * 6) Formatowanie liczb zmiennoprzecinkowych (1 i 2 miejsca po przecinku)
+ * ========================================================================
+ * 6.1) Formatowanie bez sprintf, kontrola zaokrągleń i znaków minus.
+ */
+static int format_float_two_decimals(char *out, double val) {
+    if (!out) return 0;
+    bool neg = false;
+    if (val < 0.0) { neg = true; val = -val; }
+    unsigned int v = (unsigned int)(val * 100.0 + 0.5);
+    unsigned int whole = v / 100;
+    unsigned int frac = v % 100;
+    char tmp[16];
+    int pos = 0;
+    if (neg) tmp[pos++] = '-';
+    if (whole == 0) tmp[pos++] = '0'; else {
+        char buf[12];
+        int wlen = 0;
+        unsigned int t = whole;
+        while (t) { buf[wlen++] = '0' + (t % 10); t /= 10; }
+        for (int i = wlen - 1; i >= 0; i--) tmp[pos++] = buf[i];
+    }
+    tmp[pos++] = '.';
+    tmp[pos++] = '0' + (frac / 10);
+    tmp[pos++] = '0' + (frac % 10);
+    tmp[pos] = '\0';
+    int i = 0;
+    while (tmp[i]) { out[i] = tmp[i]; i++; }
+    out[i] = '\0';
+    return i;
 }
 
+static int format_float_one_decimal(char *out, float val) {
+    if (!out) return 0;
+    bool neg = false;
+    if (val < 0.0f) { neg = true; val = -val; }
+    int v = (int)(val * 10.0f + 0.5f);
+    int whole = v / 10;
+    int frac = v % 10;
+    char tmp[12];
+    int pos = 0;
+    if (neg) tmp[pos++] = '-';
+    pos += int_to_dec(&tmp[pos], whole);
+    tmp[pos++] = '.';
+    tmp[pos++] = '0' + frac;
+    tmp[pos] = '\0';
+    int i = 0;
+    while (tmp[i]) { out[i] = tmp[i]; i++; }
+    out[i] = '\0';
+    return i;
+}
+
+/* ========================================================================
+ * 7) Pokazuje komunikat na HUD (ustawia timer)
+ * ========================================================================
+ * 7.1) show_message - ustawia tekst i resetuje timer wyświetlania (~2s).
+ */
+void show_message(const char *text) {
+    if (!text) return;
+    strcpy_s(message, (int)sizeof(message), text);
+    message_timer = 120; /* ~2s przy 60Hz */
+}
+
+/* ========================================================================
+ * 8) Aktualizacja ostatnio wciśniętego przycisku (priorytetowe ify)
+ * ========================================================================
+ * 8.1) update_last_button_pressed - zapisuje w bufie nazwę ostatniego przycisku
+ *       (priorytetowo: A > B > START > ... > analog).
+ */
+static void update_last_button_pressed(char *buf, size_t size, joypad_inputs_t inputs) {
+    if (inputs.btn.a) { strcpy_s(buf, (int)size, "A"); return; }
+    if (inputs.btn.b) { strcpy_s(buf, (int)size, "B"); return; }
+    if (inputs.btn.start) { strcpy_s(buf, (int)size, "START"); return; }
+    if (inputs.btn.l) { strcpy_s(buf, (int)size, "L"); return; }
+    if (inputs.btn.r) { strcpy_s(buf, (int)size, "R"); return; }
+    if (inputs.btn.z) { strcpy_s(buf, (int)size, "Z"); return; }
+    if (inputs.btn.c_up) { strcpy_s(buf, (int)size, "C-GÓRA"); return; }
+    if (inputs.btn.c_down) { strcpy_s(buf, (int)size, "C-DÓŁ"); return; }
+    if (inputs.btn.c_left) { strcpy_s(buf, (int)size, "C-LEWO"); return; }
+    if (inputs.btn.c_right) { strcpy_s(buf, (int)size, "C-PRAWO"); return; }
+    if (inputs.btn.d_up) { strcpy_s(buf, (int)size, "GÓRA"); return; }
+    if (inputs.btn.d_down) { strcpy_s(buf, (int)size, "DÓŁ"); return; }
+    if (inputs.btn.d_left) { strcpy_s(buf, (int)size, "LEWO"); return; }
+    if (inputs.btn.d_right) { strcpy_s(buf, (int)size, "PRAWO"); return; }
+    if (inputs.stick_x > ANALOG_DEADZONE) { strcpy_s(buf, (int)size, "ANALOG-PRAWO"); return; }
+    if (inputs.stick_x < -ANALOG_DEADZONE) { strcpy_s(buf, (int)size, "ANALOG-LEWO"); return; }
+    if (inputs.stick_y > ANALOG_DEADZONE) { strcpy_s(buf, (int)size, "ANALOG-GÓRA"); return; }
+    if (inputs.stick_y < -ANALOG_DEADZONE) { strcpy_s(buf, (int)size, "ANALOG-DÓŁ"); return; }
+    strcpy_s(buf, (int)size, "Brak");
+}
+
+/* ========================================================================
+ * 9) Format pozycji analogów "X=.. Y=.."
+ * ========================================================================
+ * 9.1) format_analog - proste złożenie tekstu "X=123 Y=-45".
+ */
 static void format_analog(char *dst, int x, int y) {
     char *p = dst;
     *p++ = 'X'; *p++ = '=';
@@ -166,7 +292,11 @@ static void format_analog(char *dst, int x, int y) {
     *p = '\0';
 }
 
-/* [6] Formatowanie czasu i pasek postępu -------------------------------- */
+/* ========================================================================
+ * 10) Format czasu "Czas: MM:SS / MM:SS"
+ * ========================================================================
+ * 10.1) format_time_line - buduje linię z czasem odtwarzania i totalem.
+ */
 static void format_time_line(char *dst, unsigned int play_min, unsigned int play_sec,
                              unsigned int total_min, unsigned int total_sec) {
     char *p = dst;
@@ -185,7 +315,12 @@ static void format_time_line(char *dst, unsigned int play_min, unsigned int play
     *p = '\0';
 }
 
-/* [7] Pomocnicze funkcje rysowania VU (unifikacja mono/stereo) ------------ */
+/* ========================================================================
+ * 11) Rysowanie miernika poziomu (wartości wygładzone przekazywane do funkcji)
+ * ========================================================================
+ * 11.1) draw_vu_meter - rysuje obramowanie + wypełnienie (vertikalny pasek).
+ *        value/max_val => wysokość wypełnienia.
+ */
 static void draw_vu_meter(display_context_t disp, int base_x, int base_y, int width, int height,
                           int value, int max_val, uint32_t box_color, uint32_t fill_color, const char *label) {
     if (max_val <= 0) max_val = 1;
@@ -197,58 +332,45 @@ static void draw_vu_meter(display_context_t disp, int base_x, int base_y, int wi
     graphics_draw_text(disp, tx, base_y + 4, label);
 }
 
-/* =========================================================================
- *  [8] Funkcja: draw_message_box
- *  Opis:
- *      Rysuje prostokątny komunikat na środku ekranu z ramką i tekstem.
- *      Wypełnienie jest jednolite w kolorze `bg_color`, a ramka w kolorze `frame_color`.
- * ========================================================================= */
-static void draw_message_box(display_context_t disp, const char *msg, uint32_t frame_color, uint32_t bg_color)
-{
-    /* [8.1] Sprawdzenie, czy jest co rysować */
-    if (!msg || msg[0] == '\0')
-        return;
-
-    /* [8.2] Wymiary boxa (260x40) i pozycja na środku ekranu 320x240 */
+/* ========================================================================
+ * 12) Okno komunikatu (środkowe)
+ * ========================================================================
+ * 12.1) draw_message_box - rysuje prostokąt z ramką i centrowanym tekstem.
+ */
+static void draw_message_box(display_context_t disp, const char *msg, uint32_t frame_color, uint32_t bg_color) {
+    if (!msg || msg[0] == '\0') return;
     const int w = 260;
     const int h = 40;
     const int x = (320 - w) / 2;
     const int y = (240 - h) / 2;
-
-    /* [8.3] Rysowanie tła – pełny prostokąt w kolorze bg_color */
     graphics_draw_box(disp, x, y, w, h, bg_color);
-
-    /* [8.4] Rysowanie ramki (pełny kolor frame_color, obrys prostokąta) */
-    graphics_draw_line(disp, x - 2, y - 2, x + w + 1, y - 2, frame_color); // góra
-    graphics_draw_line(disp, x - 2, y + h + 1, x + w + 1, y + h + 1, frame_color); // dół
-    graphics_draw_line(disp, x - 2, y - 2, x - 2, y + h + 1, frame_color); // lewa
-    graphics_draw_line(disp, x + w + 1, y - 2, x + w + 1, y + h + 1, frame_color); // prawa
-
-    /* [8.5] Rysowanie tekstu na środku boxa */
-    uint32_t text_color = graphics_make_color(0, 0, 0, 255);  /* czarny kolor tekstu */
+    graphics_draw_line(disp, x - 2, y - 2, x + w + 1, y - 2, frame_color);
+    graphics_draw_line(disp, x - 2, y + h + 1, x + w + 1, y + h + 1, frame_color);
+    graphics_draw_line(disp, x - 2, y - 2, x - 2, y + h + 1, frame_color);
+    graphics_draw_line(disp, x + w + 1, y - 2, x + w + 1, y + h + 1, frame_color);
+    uint32_t text_color = graphics_make_color(0, 0, 0, 255);
     graphics_set_color(text_color, 0);
-
-    int txt_w = tiny_strlen(msg) * 8;                         /* szerokość napisu w pikselach */
-    int txt_x = x + (w - txt_w) / 2;                          /* pozycja X wyśrodkowana */
-    int txt_y = y + (h / 2) - 6;                              /* pozycja Y lekko przesunięta w górę */
-
+    int txt_w = tiny_strlen(msg) * 8;
+    int txt_x = x + (w - txt_w) / 2;
+    int txt_y = y + (h / 2) - 6;
     graphics_draw_text(disp, txt_x, txt_y, msg);
-
-    /* [8.6] Po wyjściu z funkcji, kolor rysowania pozostaje ustawiony na kolor tekstu.
-       Caller powinien ustawić go z powrotem, jeśli jest to wymagane. */
 }
 
-
-
-/* [9] Główna funkcja programu (inicjalizacja i pętla) --------------------- */
+/* ========================================================================
+ * 13) Główna funkcja programu (inicjalizacja + pętla)
+ * ========================================================================
+ * 13.1) Inicjalizacja: display, joypad, DFS, audio, otwarcie pliku WAV64.
+ * 13.2) Pętla główna: poll kontrolerów, miks audio, analiza szczytów,
+ *       wygładzanie VU, obsługa wejścia, rysowanie UI, pomiary wydajności.
+ */
 int main(void) {
-    const int SOUND_CH = 0; /* [9] Stały kanał dźwiękowy (po prostu 0) */
+    const int SOUND_CH = 0;
 
-    /* [9.1] Inicjalizacja wyświetlacza i kontrolera */
+    /* 13.1a) Inicjalizacja wyświetlacza i kontrolera */
     display_init(RESOLUTION_320x240, DEPTH_16_BPP, 2, GAMMA_NONE, ANTIALIAS_RESAMPLE);
     joypad_init();
 
-    /* [9.2] Inicjalizacja systemu plików (DFS) - jeśli nie działa, wypisz błąd i wyjdź */
+    /* 13.1b) Inicjalizacja systemu plików (DFS) - obsługa błędu */
     if (dfs_init(DFS_DEFAULT_LOCATION) != DFS_ESUCCESS) {
         surface_t *disp = display_get();
         uint32_t black = graphics_make_color(0, 0, 0, 255);
@@ -260,7 +382,7 @@ int main(void) {
         return 1;
     }
 
-    /* [9.3] Wczytanie nagłówka WAV64 (krótki hexdump) by wykryć manual_compression_level */
+    /* 13.1c) Krótki hexdump nagłówka WAV64 (do HUD) */
     uint8_t manual_compression_level = 0;
     char header_hex_string[64]; header_hex_string[0] = '\0';
     int dfs_bytes_read = -1;
@@ -279,41 +401,41 @@ int main(void) {
             if (ptr < (int)sizeof(header_hex_string)) header_hex_string[ptr] = '\0';
             fclose(f);
         } else {
-            strcpy_s(header_hex_string, (int)sizeof(header_hex_string), "Read error");
+            strcpy_s(header_hex_string, (int)sizeof(header_hex_string), "Blad odczytu");
         }
     }
 
-    /* [9.4] Timer (FPS) init */
+    /* 13.1d) Timer / FPS init */
     timer_init();
     last_frame_ticks = timer_ticks();
 
-    /* [9.5] Ustawienie i inicjalizacja kompresji (jeśli potrzeba) */
+    /* 13.1e) Inicjalizacja kompresji WAV64 (bezpieczne ustawienie wartości) */
     int compression_level = (int)manual_compression_level;
     if (compression_level != 0 && compression_level != 1 && compression_level != 3) compression_level = 0;
     wav64_init_compression(compression_level);
 
-    /* [9.6] Otwieranie pliku i inicjalizacja audio/miksera */
+    /* 13.1f) Otwarcie pliku WAV64 i inicjalizacja audio/mixera */
     const char *filename = "rom:/sound.wav64";
     wav64_t sound;
-    memset(&sound, 0, sizeof(sound));
+    fast_memset(&sound, 0, sizeof(sound));
     wav64_open(&sound, filename);
     audio_init((int)sound.wave.frequency, 4);
     mixer_init(32);
-    wav64_set_loop(&sound, true); /* biblioteka też może mieć loop, ale program steruje restartem */
+    wav64_set_loop(&sound, true);
 
-    /* [9.7] Zarządzanie pozycji odtwarzania (tylko jedna zmienna potrzebna) */
-    uint32_t current_sample_pos = 0; /* [9.7] Pozycja w próbkach używana przy pauzie/seek */
+    /* 13.1g) Stan odtwarzania */
+    uint32_t current_sample_pos = 0;
     bool is_playing = false;
     int sound_channel = SOUND_CH;
 
-    /* [9.8] Start odtwarzania od 0 */
+    /* 13.1h) Start odtwarzania */
     current_sample_pos = 0;
     wav64_play(&sound, sound_channel);
     mixer_ch_set_pos(sound_channel, (float)current_sample_pos);
     is_playing = true;
     mixer_ch_set_vol(sound_channel, volume, volume);
 
-    /* [9.9] Parametry audio (pobrane z wav64_t) */
+    /* 13.1i) Parametry audio (cache) */
     uint32_t sample_rate = (uint32_t)(sound.wave.frequency + 0.5f);
     uint8_t channels = sound.wave.channels;
     uint32_t total_samples = (uint32_t)sound.wave.len;
@@ -325,39 +447,49 @@ int main(void) {
     uint32_t bitrate_kbps = (bitrate_bps > 0) ? (uint32_t)(bitrate_bps / 1000) :
                          (uint32_t)((sample_rate * (uint32_t)channels * (uint32_t)bits_per_sample) / 1000U);
 
-    /* [9.10] Bufory i kolory (cache) */
-    char last_button_pressed[32]; strcpy_s(last_button_pressed, (int)sizeof(last_button_pressed), "Brak");
-    char analog_pos[32]; strcpy_s(analog_pos, (int)sizeof(analog_pos), "X=0 Y=0");
-
+    /* 13.1j) Bufory w arenie + kolory (alokowane z arena_alloc) */
+    char *last_button_pressed = (char *)arena_alloc(32);
+    if (last_button_pressed) strcpy_s(last_button_pressed, 32, "Brak");
+    char *analog_pos = (char *)arena_alloc(32);
+    if (analog_pos) strcpy_s(analog_pos, 32, "X=0 Y=0");
     uint32_t bg_color = graphics_make_color(0, 0, 64, 255);
     uint32_t white    = graphics_make_color(255, 255, 255, 255);
     uint32_t green    = graphics_make_color(0, 255, 0, 255);
-    uint32_t box_frame_color = graphics_make_color(0, 200, 0, 255); /* ciemniejsza zieleń */
-    uint32_t box_bg_color    = graphics_make_color(0, 200, 0, 255); /* używana w szachownicy (bez alfowania) */
+    uint32_t box_frame_color = graphics_make_color(0, 200, 0, 255);
+    uint32_t box_bg_color    = graphics_make_color(0, 200, 0, 255);
+    bool loop_enabled = true;
+    char *linebuf = (char *)arena_alloc(256);
+    char *hex_line1 = (char *)arena_alloc(40);
+    char *hex_line2 = (char *)arena_alloc(40);
+    char *perfbuf = (char *)arena_alloc(128);
+    char *tmpbuf = (char *)arena_alloc(64);
 
-    bool loop_enabled = true; /* [9.10] Sterowanie automatycznym restartem */
+    /* 13.1k) Zmienne poziomów miernika (szczyty odczytane w klatce) */
+    int max_amp = 0, max_amp_l = 0, max_amp_r = 0;
 
-    /* [9.11] Główna pętla aplikacji --------------------------------------- */
+    /* 13.2) Główna pętla - niekończąca się (do momentu resetu/wyłączenia) */
     while (1) {
-        int max_amp = 0, max_amp_l = 0, max_amp_r = 0;
+        float frame_start_ms = get_ticks_ms();
+        float frame_interval_ms = (last_frame_start_ms > 0.0f) ? (frame_start_ms - last_frame_start_ms) : (1000.0f / 60.0f);
 
-        /* [9.11.1] Poll kontrolerów i aktualizacja sygnałów wejścia */
+        max_amp = max_amp_l = max_amp_r = 0;
+
+        /* 13.2a) Odczyt kontrolerów */
         joypad_poll();
         joypad_inputs_t inputs = joypad_get_inputs(JOYPAD_PORT_1);
-        update_last_button_pressed_optimized(last_button_pressed, sizeof(last_button_pressed), inputs);
+        update_last_button_pressed(last_button_pressed, 32, inputs);
 
-        /* [9.11.2] Formatowanie pozycji analoga (martwa strefa) */
         int ax = inputs.stick_x;
         int ay = inputs.stick_y;
         if ((unsigned)(ax + ANALOG_DEADZONE) < (ANALOG_DEADZONE * 2)) ax = 0;
         if ((unsigned)(ay + ANALOG_DEADZONE) < (ANALOG_DEADZONE * 2)) ay = 0;
         format_analog(analog_pos, ax, ay);
 
-        /* [9.11.3] Odtwarzanie audio i wyliczanie VU (jeśli bufor audio wymaga danych) */
+        /* 13.2b) Miksowanie audio i analiza szczytów (jeśli audio możliwe do zapisu) */
         if (audio_can_write()) {
             short *outbuf = audio_write_begin();
             int buf_len = audio_get_buffer_length();
-            mixer_poll(outbuf, buf_len); /* [9.11.3] Mixer wypełnia bufor wyjściowy */
+            mixer_poll(outbuf, buf_len);
             if (channels == 2) {
                 for (int i = 0; i + 1 < buf_len; i += 2) {
                     int l = abs((int)outbuf[i]);
@@ -374,19 +506,30 @@ int main(void) {
             audio_write_end();
         }
 
-        /* [9.11.4] Zarządzanie końcem odtwarzania i automatyczny restart (loop) */
+        /* 13.2c) Wygładzanie miernika poziomu (połowiczny zanik) - algorytm half-life */
+        {
+            float decay_factor = powf(0.5f, frame_interval_ms / VU_HALF_LIFE_MS);
+            float peak_l = (float)max_amp_l;
+            float cur_l = smoothed_vu_l * decay_factor;
+            if (peak_l > cur_l) cur_l = peak_l;
+            if (fabsf(cur_l - smoothed_vu_l) > VU_MIN_DELTA) smoothed_vu_l = cur_l;
+
+            float peak_r = (float)max_amp_r;
+            float cur_r = smoothed_vu_r * decay_factor;
+            if (peak_r > cur_r) cur_r = peak_r;
+            if (fabsf(cur_r - smoothed_vu_r) > VU_MIN_DELTA) smoothed_vu_r = cur_r;
+        }
+
+        /* 13.2d) Auto restart / koniec utworu (zależnie od loop_enabled) */
         if (!mixer_ch_playing(sound_channel)) {
             if (loop_enabled) {
-                /* [9.11.4.a] Zrestartuj odtwarzanie od początku; SEEK nigdy nie jest wykonywane
-                   automatycznie dla VADPCM/Opus - zawsze start od 0. */
                 wav64_play(&sound, sound_channel);
                 mixer_ch_set_pos(sound_channel, 0.0f);
                 mixer_ch_set_vol(sound_channel, volume, volume);
                 is_playing = true;
                 current_sample_pos = 0;
-                show_message("Restart (loop)");
+                show_message("Restart (petla)");
             } else {
-                /* [9.11.4.b] Jeśli pętla wyłączona, ustaw stan zakończenia raz. */
                 if (is_playing) {
                     is_playing = false;
                     current_sample_pos = total_samples;
@@ -395,7 +538,7 @@ int main(void) {
             }
         }
 
-        /* [9.11.5] Obliczanie pozycji do wyświetlenia - tylko gdy kanał aktualnie gra */
+        /* 13.2e) Obliczenie pozycji aktualnej do wyświetlenia */
         uint32_t current_sample_pos_display = current_sample_pos;
         if (is_playing && mixer_ch_playing(sound_channel)) {
             float pos_f = mixer_ch_get_pos(sound_channel);
@@ -405,27 +548,24 @@ int main(void) {
             current_sample_pos_display = (uint32_t)pos_u;
         }
 
-        /* [9.11.6] Konwersja na minuty/sekundy */
         uint32_t elapsed_sec = (sample_rate) ? (current_sample_pos_display / sample_rate) : 0;
         uint32_t play_min = elapsed_sec / 60U;
         uint32_t play_sec = elapsed_sec % 60U;
 
-        /* [9.11.7] Przygotowanie ekranu */
+        /* 13.2f) Rysowanie UI - ekran, tytuł, informacje */
         surface_t *disp = display_get();
         graphics_fill_screen(disp, bg_color);
         graphics_set_color(white, 0);
 
-        /* [9.11.8] Rysowanie HUD i tekstów */
-        char linebuf[128];
         const char *title = "mca64Player";
         int title_x = (320 - tiny_strlen(title) * 8) / 2;
         graphics_draw_text(disp, title_x, 4, title);
         graphics_draw_text(disp, 4, 4, last_button_pressed);
         graphics_draw_text(disp, 4, 16, analog_pos);
 
-        strcpy_s(linebuf, (int)sizeof(linebuf), "Plik: ");
+        strcpy_s(linebuf, 128, "Plik: ");
         int off = tiny_strlen(linebuf);
-        int remaining = (int)sizeof(linebuf) - off;
+        int remaining = (int)128 - off;
         strcpy_s(&linebuf[off], remaining, filename);
         graphics_draw_text(disp, 10, 28, linebuf);
 
@@ -433,7 +573,7 @@ int main(void) {
                          (unsigned)total_minutes, (unsigned)total_secs_rem);
         graphics_draw_text(disp, 10, 46, linebuf);
 
-        /* [9.11.9] Pasek postępu */
+        /* 13.2g) Pasek postępu */
         int bar_x = 10, bar_y = 58, bar_w = 300, bar_h = 8;
         graphics_draw_box(disp, bar_x, bar_y, bar_w, bar_h, white);
         if (total_seconds > 0) {
@@ -442,78 +582,73 @@ int main(void) {
             graphics_draw_box(disp, bar_x, bar_y, pw, bar_h, green);
         }
 
-        /* [9.11.10] Parametry audio (tekst) */
-        strcpy_s(linebuf, (int)sizeof(linebuf), "Probkowanie: ");
+        /* 13.2h) Parametry audio (tekst) */
+        strcpy_s(linebuf, 128, "Probkowanie: ");
         off = tiny_strlen(linebuf);
         off += int_to_dec(&linebuf[off], (int)sample_rate);
-        strcpy_s(&linebuf[off], (int)sizeof(linebuf) - off, " Hz");
+        strcpy_s(&linebuf[off], 128 - off, " Hz");
         graphics_draw_text(disp, 10, 76, linebuf);
 
-        strcpy_s(linebuf, (int)sizeof(linebuf), "Bitrate: ");
+        strcpy_s(linebuf, 128, "Bitrate: ");
         off = tiny_strlen(linebuf);
         off += int_to_dec(&linebuf[off], (int)bitrate_kbps);
-        strcpy_s(&linebuf[off], (int)sizeof(linebuf) - off, " kbps");
+        strcpy_s(&linebuf[off], 128 - off, " kbps");
         graphics_draw_text(disp, 10, 94, linebuf);
 
-        if (channels == 1) strcpy_s(linebuf, (int)sizeof(linebuf), "Kanaly: Mono (1)");
-        else strcpy_s(linebuf, (int)sizeof(linebuf), "Kanaly: Stereo (2)");
+        if (channels == 1) strcpy_s(linebuf, 128, "Kanaly: Mono (1)");
+        else strcpy_s(linebuf, 128, "Kanaly: Stereo (2)");
         graphics_draw_text(disp, 10, 112, linebuf);
 
-        strcpy_s(linebuf, (int)sizeof(linebuf), "Bity: ");
+        strcpy_s(linebuf, 128, "Bity: ");
         off = tiny_strlen(linebuf);
         off += int_to_dec(&linebuf[off], (int)bits_per_sample);
-        strcpy_s(&linebuf[off], (int)sizeof(linebuf) - off, " bit");
+        strcpy_s(&linebuf[off], 128 - off, " bit");
         graphics_draw_text(disp, 10, 130, linebuf);
 
-        strcpy_s(linebuf, (int)sizeof(linebuf), "Kompresja (z lib): ");
+        strcpy_s(linebuf, 128, "Kompresja: ");
         off = tiny_strlen(linebuf);
-        if (compression_level == 0) strcpy_s(&linebuf[off], (int)sizeof(linebuf) - off, "PCM");
-        else if (compression_level == 1) strcpy_s(&linebuf[off], (int)sizeof(linebuf) - off, "VADPCM");
-        else if (compression_level == 3) strcpy_s(&linebuf[off], (int)sizeof(linebuf) - off, "Opus");
-        else strcpy_s(&linebuf[off], (int)sizeof(linebuf) - off, "Nieznany");
-        graphics_draw_text(disp, 10, 148, linebuf);
-
-        strcpy_s(linebuf, (int)sizeof(linebuf), "Kompresja (manual): ");
-        off = tiny_strlen(linebuf);
-        if (manual_compression_level == 0) strcpy_s(&linebuf[off], (int)sizeof(linebuf) - off, "PCM");
-        else if (manual_compression_level == 1) strcpy_s(&linebuf[off], (int)sizeof(linebuf) - off, "VADPCM");
-        else if (manual_compression_level == 3) strcpy_s(&linebuf[off], (int)sizeof(linebuf) - off, "Opus");
+        if (manual_compression_level == 0) strcpy_s(&linebuf[off], 128 - off, "PCM");
+        else if (manual_compression_level == 1) strcpy_s(&linebuf[off], 128 - off, "VADPCM");
+        else if (manual_compression_level == 3) strcpy_s(&linebuf[off], 128 - off, "Opus");
         else { off += int_to_dec(&linebuf[off], (int)manual_compression_level); }
         graphics_draw_text(disp, 10, 166, linebuf);
 
-        strcpy_s(linebuf, (int)sizeof(linebuf), "Probek: ");
+        strcpy_s(linebuf, 128, "Probek: ");
         off = tiny_strlen(linebuf);
-        off += int_to_dec(&linebuf[off], total_samples);
+        off += int_to_dec(&linebuf[off], (int)total_samples);
         graphics_draw_text(disp, 10, 184, linebuf);
 
-        /* [9.11.11] VU-metry */
+        /* 13.2i) Mierniki poziomu */
         int vu_base_x = 280;
         int vu_base_y = 200;
         int vu_width = 8;
         int vu_height = 40;
+        int draw_vu_l = (int)smoothed_vu_l;
+        int draw_vu_r = (int)smoothed_vu_r;
         if (channels == 2) {
-            draw_vu_meter(disp, vu_base_x - 0, vu_base_y, vu_width, vu_height, max_amp_l, 32768, white, green, "L");
-            draw_vu_meter(disp, vu_base_x + vu_width + 10, vu_base_y, vu_width, vu_height, max_amp_r, 32768, white, green, "R");
+            draw_vu_meter(disp, vu_base_x - 0, vu_base_y, vu_width, vu_height, draw_vu_l, 32768, white, green, "L");
+            draw_vu_meter(disp, vu_base_x + vu_width + 10, vu_base_y, vu_width, vu_height, draw_vu_r, 32768, white, green, "R");
         } else {
-            draw_vu_meter(disp, vu_base_x + 8, vu_base_y, vu_width, vu_height, max_amp, 32768, white, green, "Mono");
+            int mono_v = (draw_vu_l > draw_vu_r) ? draw_vu_l : draw_vu_r;
+            if (mono_v == 0) mono_v = max_amp;
+            draw_vu_meter(disp, vu_base_x + 8, vu_base_y, vu_width, vu_height, mono_v, 32768, white, green, "Mono");
         }
 
-        /* [9.11.12] Hex dump nagłówka (2 linie) */
-        char hex_line1[40] = {0}, hex_line2[40] = {0};
+        /* 13.2j) Nagłówek hex (2 linie) */
         int hex_len = tiny_strlen(header_hex_string);
         int groups = hex_len / 3;
         int split_groups = groups / 2;
         int split_pos = split_groups * 3;
         int i = 0, idx = 0;
-        for (i = 0; i < split_pos && i < (int)sizeof(hex_line1) - 1; i++) hex_line1[i] = header_hex_string[i];
+        for (i = 0; i < split_pos && i < (int)40 - 1; i++) hex_line1[i] = header_hex_string[i];
         hex_line1[i] = '\0';
         idx = 0;
-        for (i = split_pos; i < hex_len && idx < (int)sizeof(hex_line2) - 1; i++) hex_line2[idx++] = header_hex_string[i];
+        for (i = split_pos; i < hex_len && idx < (int)40 - 1; i++) hex_line2[idx++] = header_hex_string[i];
         hex_line2[idx] = '\0';
         graphics_draw_text(disp, 10, 202, hex_line1);
         graphics_draw_text(disp, 10, 212, hex_line2);
 
-        /* [9.11.13] Inline: update_perf_counters() i draw_perf_hud(disp) */
+        /* 13.2k) Liczniki wydajności: surowy FPS i wygładzenie do wyświetlenia */
         {
             uint32_t now_ticks = timer_ticks();
             uint32_t diff_ticks = now_ticks - last_frame_ticks;
@@ -522,27 +657,46 @@ int main(void) {
             }
             last_frame_ticks = now_ticks;
         }
-        {
-            char perfbuf[64];
-            snprintf(perfbuf, sizeof(perfbuf), "FPS: %lu", (unsigned long)fps);
-            graphics_draw_text(disp, 10, 230, perfbuf);
-            double ram_total = get_memory_size() / (1024.0 * 1024.0);
-            struct mallinfo mi = mallinfo();
-            double used_heap = mi.uordblks / (1024.0 * 1024.0);
-            double ram_free = ram_total - used_heap;
-            snprintf(perfbuf, sizeof(perfbuf), "RAM: %.2f MB", ram_total);
-            graphics_draw_text(disp, 74, 230, perfbuf);
-            snprintf(perfbuf, sizeof(perfbuf), "Free: %.2f MB", ram_free);
-            graphics_draw_text(disp, 200, 230, perfbuf);
-        }
+        if (smoothed_fps <= 0.0f) smoothed_fps = (float)fps;
+        else smoothed_fps = (1.0f - FRAME_MS_ALPHA) * smoothed_fps + FRAME_MS_ALPHA * (float)fps;
 
-        /* [9.11.14] OBSŁUGA PRZYCISKÓW (rising edge) */
+        strcpy_s(perfbuf, 128, "FPS: ");
+        off = tiny_strlen(perfbuf);
+        off += int_to_dec(&perfbuf[off], (int)(smoothed_fps + 0.5f));
+        graphics_draw_text(disp, 10, 230, perfbuf);
+
+        /* 13.2l) Pomiar RAM: użycie arena + mallinfo + obliczenie wolnego RAM w MB
+           13.2l.1) ram_total = get_memory_size() w MB
+           13.2l.2) used_malloc = mallinfo().uordblks (bajty)
+           13.2l.3) used_arena = mem_used (bajty)
+           13.2l.4) used_total_mb = (used_malloc + used_arena) / (1024*1024)
+           13.2l.5) ram_free = ram_total - used_total_mb (clamp >=0)
+        */
+        double ram_total = get_memory_size() / (1024.0 * 1024.0); /* w MB */
+        struct mallinfo mi = mallinfo();
+        double used_malloc = (double)mi.uordblks; /* bajty */
+        double used_arena = (double)mem_used; /* bajty */
+        double used_total_mb = (used_malloc + used_arena) / (1024.0 * 1024.0);
+        double ram_free = ram_total - used_total_mb;
+        if (ram_free < 0.0) ram_free = 0.0; /* zabezpieczenie */
+
+        /* 13.2m) Rysuj RAM i Free (formatowane dwoma miejscami po przecinku) */
+        strcpy_s(perfbuf, 128, "RAM: ");
+        format_float_two_decimals(&perfbuf[tiny_strlen(perfbuf)], ram_total);
+        off = tiny_strlen(perfbuf);
+        strcpy_s(&perfbuf[off], 128 - off, " MB");
+        graphics_draw_text(disp, 74, 230, perfbuf);
+
+        strcpy_s(perfbuf, 128, "Free: ");
+        format_float_two_decimals(&perfbuf[tiny_strlen(perfbuf)], ram_free);
+        off = tiny_strlen(perfbuf);
+        strcpy_s(&perfbuf[off], 128 - off, " MB");
+        graphics_draw_text(disp, 200, 230, perfbuf);
+
+        /* 13.2n) Obsługa wejścia (krawędź narastająca) - odtwarzanie i przewijanie */
         joypad_buttons_t keys = joypad_get_buttons_pressed(JOYPAD_PORT_1);
-
-        /* START/A - pauza / wznowienie (toggle) */
         if (keys.start || keys.a) {
             if (is_playing && mixer_ch_playing(sound_channel)) {
-                /* [9.11.14.a] Pauza: zapamiętuje pozycję i zatrzymuje kanał */
                 float pos_f = mixer_ch_get_pos(sound_channel);
                 if (pos_f < 0.0f) pos_f = 0.0f;
                 uint64_t pos_u = (uint64_t)(pos_f + 0.5f);
@@ -552,10 +706,9 @@ int main(void) {
                 is_playing = false;
                 show_message("Pauza");
             } else {
-                /* [9.11.14.b] Wznowienie: jeśli format nie wspiera seek i jest offset -> start od 0 */
                 if (compression_level != 0 && current_sample_pos != 0) {
                     current_sample_pos = 0;
-                    show_message("Seek niedostepny - start od poczatku");
+                    show_message("Niedostepne - start od poczatku");
                 }
                 wav64_play(&sound, sound_channel);
                 mixer_ch_set_pos(sound_channel, (float)current_sample_pos);
@@ -564,16 +717,12 @@ int main(void) {
                 show_message("Wznowiono");
             }
         }
-
-        /* B - stop i reset do początku */
         if (keys.b) {
             if (mixer_ch_playing(sound_channel)) mixer_ch_stop(sound_channel);
             current_sample_pos = 0;
             is_playing = false;
             show_message("Stop");
         }
-
-        /* Seek przyciskami - tylko dla PCM (compression_level == 0) */
         if (keys.l || keys.d_left) {
             if (compression_level == 0) {
                 int64_t delta_samples = (int64_t)5 * (int64_t)sample_rate;
@@ -582,7 +731,7 @@ int main(void) {
                 current_sample_pos = (uint32_t)newpos;
                 if (is_playing && mixer_ch_playing(sound_channel)) mixer_ch_set_pos(sound_channel, (float)current_sample_pos);
                 show_message("Przewijanie -5s");
-            } else show_message("Seek niedostepny dla tego formatu");
+            } else show_message("Niedostepne dla tego formatu");
         }
         if (keys.r || keys.d_right) {
             if (compression_level == 0) {
@@ -592,7 +741,7 @@ int main(void) {
                 current_sample_pos = (uint32_t)newpos;
                 if (is_playing && mixer_ch_playing(sound_channel)) mixer_ch_set_pos(sound_channel, (float)current_sample_pos);
                 show_message("Przewijanie +5s");
-            } else show_message("Seek niedostepny dla tego formatu");
+            } else show_message("Niedostepne dla tego formatu");
         }
         if (keys.c_left) {
             if (compression_level == 0) {
@@ -602,7 +751,7 @@ int main(void) {
                 current_sample_pos = (uint32_t)newpos;
                 if (is_playing && mixer_ch_playing(sound_channel)) mixer_ch_set_pos(sound_channel, (float)current_sample_pos);
                 show_message("Przewijanie -30s");
-            } else show_message("Seek niedostepny dla tego formatu");
+            } else show_message("Niedostepne dla tego formatu");
         }
         if (keys.c_right) {
             if (compression_level == 0) {
@@ -612,48 +761,89 @@ int main(void) {
                 current_sample_pos = (uint32_t)newpos;
                 if (is_playing && mixer_ch_playing(sound_channel)) mixer_ch_set_pos(sound_channel, (float)current_sample_pos);
                 show_message("Przewijanie +30s");
-            } else show_message("Seek niedostepny dla tego formatu");
+            } else show_message("Niedostepne dla tego formatu");
         }
 
-        /* [9.11.15] Głośność (D-Up / D-Down / C-Up / C-Down) */
+        /* 13.2o) Regulacja głośności */
         if (keys.d_up || keys.c_up) {
             volume += 0.1f;
             if (volume > 1.0f) volume = 1.0f;
             mixer_ch_set_vol(sound_channel, volume, volume);
-            char tmp[64];
-            snprintf(tmp, sizeof(tmp), "Glosnosc: %.1f", volume);
-            show_message(tmp);
+            strcpy_s(tmpbuf, 64, "Glosnosc: ");
+            int len = tiny_strlen(tmpbuf);
+            format_float_one_decimal(&tmpbuf[len], volume);
+            show_message(tmpbuf);
         }
         if (keys.d_down || keys.c_down) {
             volume -= 0.1f;
             if (volume < 0.0f) volume = 0.0f;
             mixer_ch_set_vol(sound_channel, volume, volume);
-            char tmp[64];
-            snprintf(tmp, sizeof(tmp), "Glosnosc: %.1f", volume);
-            show_message(tmp);
+            strcpy_s(tmpbuf, 64, "Glosnosc: ");
+            int len = tiny_strlen(tmpbuf);
+            format_float_one_decimal(&tmpbuf[len], volume);
+            show_message(tmpbuf);
         }
 
-        /* [9.11.16] Toggle loop on/off (Z) */
+        /* 13.2p) Włączenie/wyłączenie pętli (klawisz Z) */
         if (keys.z) {
             loop_enabled = !loop_enabled;
-            wav64_set_loop(&sound, loop_enabled); /* informuje bibliotekę */
-            if (loop_enabled) show_message("Petla: ON"); else show_message("Petla: OFF");
+            wav64_set_loop(&sound, loop_enabled);
+            if (loop_enabled) show_message("Pętla: WŁĄCZONA"); else show_message("Pętla: WYŁĄCZONA");
         }
 
-        /* [9.11.17] Rysowanie komunikatu (okno) - zielone, "półprzezroczyste" (szachownica) */
+        /* 13.2q) Rysowanie okna komunikatu (jeśli jest aktywny) */
         if (message_timer > 0) {
             draw_message_box(disp, message, box_frame_color, box_bg_color);
             message_timer--;
-            /* Przywróć kolor tekstu dla następnych elementów (gdyby były) */
             graphics_set_color(white, 0);
         }
 
-        /* [9.11.18] Wyświetlenie bufora i odczekanie ~33 ms (~30FPS) */
+        /* 13.2r) Rysowanie średniego zużycia procesora i czasu klatki */
+        {
+            int cpu_avg_int = (int)(cpu_usage_get_avg() + 0.5f);
+            strcpy_s(perfbuf, 128, "CPU: ");
+            int p = tiny_strlen(perfbuf);
+            p += int_to_dec(&perfbuf[p], cpu_avg_int);
+            perfbuf[p++] = '%';
+            perfbuf[p++] = ' ';
+            format_float_two_decimals(&perfbuf[p], (double)last_cpu_ms_display);
+            p = tiny_strlen(perfbuf);
+            strcpy_s(&perfbuf[p], 128 - p, "ms");
+            graphics_draw_text(disp, 180, 16, perfbuf);
+        }
+
+        /* 13.2s) Koniec rysowania - wyświetlenie bufora */
         display_show(disp);
-        wait_ms(33);
+
+        /* 13.2t) Pomiar końcowy klatki, obliczenie measured_ms i procentu CPU */
+        float frame_end_ms = get_ticks_ms();
+        float measured_ms = frame_end_ms - frame_start_ms;
+
+        /* 13.2u) Poprawka interwału między startami (bezpieczny fallback) */
+        if (last_frame_start_ms > 0.0f) frame_interval_ms = frame_start_ms - last_frame_start_ms;
+        if (frame_interval_ms <= 0.0f) frame_interval_ms = (measured_ms > 0.0f) ? measured_ms : (1000.0f / 60.0f);
+
+        float cpu_percent = (frame_interval_ms > 0.0f) ? ((measured_ms / frame_interval_ms) * 100.0f) : 0.0f;
+        if (cpu_percent > 100.0f) cpu_percent = 100.0f;
+        if (cpu_percent < 0.0f) cpu_percent = 0.0f;
+        cpu_usage_add_sample(cpu_percent);
+
+        /* 13.2v) Wygładzenie czasu klatki (EMA) - bardzo łagodne */
+        if (smoothed_frame_ms <= 0.0f) smoothed_frame_ms = measured_ms;
+        else {
+            float new_smoothed = (1.0f - FRAME_MS_ALPHA) * smoothed_frame_ms + FRAME_MS_ALPHA * measured_ms;
+            if (fabsf(new_smoothed - smoothed_frame_ms) > FRAME_MS_DISPLAY_THRESHOLD) smoothed_frame_ms = new_smoothed;
+        }
+        last_cpu_ms_display = smoothed_frame_ms;
+
+        /* 13.2w) Zachowanie startu klatki dla następnej iteracji */
+        last_frame_start_ms = frame_start_ms;
+
+        /* 13.2x) Krótki oddech (yield) - zapobiega spin-loop */
+        wait_ms(2);
     }
 
-    /* [9.12] Sprzątanie (nigdy tu nie wejdzie w normalnym przebiegu) */
+    /* 13.3) Sprzątanie (zwykle nieosiągalne w tej wersji programu) */
     if (mixer_ch_playing(sound_channel)) mixer_ch_stop(sound_channel);
     wav64_close(&sound);
     audio_close();
