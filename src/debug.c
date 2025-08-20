@@ -1,82 +1,82 @@
-// [1] Nagłówki wymagane przez funkcję debug_info
-#include "debug.h"           // [1.1] Własny interfejs funkcji debug_info
-#include "utils.h"           // [1.2] Pomocnicze funkcje: formatowanie liczb, bezpieczne kopiowanie
-// [2] Główna funkcja wyświetlająca dane diagnostyczne na ekranie
+/* [1] debug.c - Diagnostics and debug info rendering for N64 display. */
+#include "debug.h"     /* [2] Own header for debug_info */
+#include "utils.h"     /* [3] Helper functions: formatting, safe string copy */
+
+/* [4] Draw diagnostic information (audio, performance, memory, uptime) on screen. */
 void debug_info(surface_t *disp, int sample_rate, float frame_ms, float cpu_percent,
-                float fps, int free_ram, int start_x, int start_y)
-{
-    // [2.1] Pobranie stanu bufora audio
-    int can_write = audio_can_write();             // [2.1.1] Czy można pisać do bufora audio (0 = pełny, !=0 = wolny)
-    int buf_len = audio_get_buffer_length();       // [2.1.2] Liczba próbek w buforze
-    float buf_ms = (float)buf_len / (float)sample_rate * 1000.0f; // [2.1.3] Czas trwania bufora w milisekundach
-
-    // [2.2] Ustawienie koloru tekstu debugowego (żółty, pełna przezroczystość)
+                float fps, int free_ram, int start_x, int start_y, unsigned int uptime_sec) {
+    int can_write = audio_can_write();
+    int buf_len = audio_get_buffer_length();
+    float buf_ms = (float)buf_len / (float)sample_rate * 1000.0f;
     graphics_set_color(graphics_make_color(255, 255, 0, 255), 0);
+    char tmp[128];
+    int line_height = 15;
+    int y = start_y;
+    int pos = 0;
 
-    // [2.3] Inicjalizacja zmiennych pomocniczych
-    char tmp[128];                // [2.3.1] Bufor tekstowy do formatowania danych
-    int line_height = 15;         // [2.3.2] Odległość między liniami tekstu
-    int y = start_y;              // [2.3.3] Aktualna pozycja Y tekstu
-    int pos = 0;                  // [2.3.4] Pozycja w buforze tmp
-
-    // [3] Tymczasowe pole (można rozszerzyć np. o menu_selected)
-    strcpy_s(tmp, sizeof(tmp), "");               // [3.1] Pusta linia lub miejsce na przyszłe dane
-    graphics_draw_text(disp, start_x, y, tmp);    // [3.2] Rysowanie pustej linii
+    /* [5] Audio buffer status */
+    strcpy_s(tmp, sizeof(tmp), "Audio can write: ");
+    safe_append_str(tmp, sizeof(tmp), -1, can_write ? "YES" : "NO");
+    graphics_draw_text(disp, start_x, y, tmp);
     y += line_height;
 
-    // [4] Informacja o możliwości zapisu do bufora audio
-    strcpy_s(tmp, sizeof(tmp), "Audio can write: ");                      // [4.1] Nagłówek
-    safe_append_str(tmp, sizeof(tmp), -1, can_write ? "YES" : "NO");     // [4.2] Dodanie wartości logicznej
-    graphics_draw_text(disp, start_x, y, tmp);                            // [4.3] Rysowanie tekstu
-    y += line_height;
-
-    // [5] Długość bufora audio w próbkach i milisekundach
+    /* [6] Audio buffer length in samples and ms */
     pos = 0;
-    strcpy_s(tmp, sizeof(tmp), "");                                       // [5.1] Reset bufora
-    pos += int_to_dec(&tmp[pos], buf_len);                                // [5.2] Liczba próbek
-    strcpy_s(&tmp[pos], sizeof(tmp) - pos, " samples (");                 // [5.3] Tekst pomocniczy
-    pos += tiny_strlen(&tmp[pos]);                                        // [5.4] Aktualizacja pozycji
-    pos += format_float_two_decimals(&tmp[pos], buf_ms);                 // [5.5] Bufor w ms
-    strcpy_s(&tmp[pos], sizeof(tmp) - pos, " ms)");                       // [5.6] Zamknięcie nawiasu
-    graphics_draw_text(disp, start_x, y, tmp);                            // [5.7] Rysowanie tekstu
+    pos += int_to_dec(&tmp[pos], buf_len);
+    strcpy_s(&tmp[pos], sizeof(tmp) - pos, " samples (");
+    pos += tiny_strlen(&tmp[pos]);
+    pos += format_float_two_decimals(&tmp[pos], buf_ms);
+    strcpy_s(&tmp[pos], sizeof(tmp) - pos, " ms)");
+    graphics_draw_text(disp, start_x, y, tmp);
     y += line_height;
 
-    // [6] Częstotliwość próbkowania audio
+    /* [7] Audio sample rate */
     pos = 0;
-    strcpy_s(tmp, sizeof(tmp), "");
-    pos += int_to_dec(&tmp[pos], sample_rate);                            // [6.1] Wartość Hz
-    strcpy_s(&tmp[pos], sizeof(tmp) - pos, " Hz");                        // [6.2] Jednostka
-    graphics_draw_text(disp, start_x, y, tmp);                            // [6.3] Rysowanie tekstu
+    pos += int_to_dec(&tmp[pos], sample_rate);
+    strcpy_s(&tmp[pos], sizeof(tmp) - pos, " Hz");
+    graphics_draw_text(disp, start_x, y, tmp);
     y += line_height;
 
-    // [7] Czas renderowania jednej klatki
+    /* [8] Frame render time (ms) */
     pos = 0;
-    strcpy_s(tmp, sizeof(tmp), "");
-    pos += format_float_two_decimals(&tmp[pos], frame_ms);               // [7.1] Wartość w ms
-    strcpy_s(&tmp[pos], sizeof(tmp) - pos, " ms");                        // [7.2] Jednostka
-    graphics_draw_text(disp, start_x, y, tmp);                            // [7.3] Rysowanie tekstu
+    pos += format_float_two_decimals(&tmp[pos], frame_ms);
+    strcpy_s(&tmp[pos], sizeof(tmp) - pos, " ms");
+    graphics_draw_text(disp, start_x, y, tmp);
     y += line_height;
 
-    // [8] Użycie CPU w procentach
+    /* [9] CPU usage (%) */
     pos = 0;
-    strcpy_s(tmp, sizeof(tmp), "");
-    pos += format_float_two_decimals(&tmp[pos], cpu_percent);            // [8.1] Wartość %
+    pos += format_float_two_decimals(&tmp[pos], cpu_percent);
     strcpy_s(&tmp[pos], sizeof(tmp) - pos, " %");
     graphics_draw_text(disp, start_x, y, tmp);
     y += line_height;
 
-    // [9] Liczba klatek na sekundę (FPS)
+    /* [10] Frames per second (FPS) */
     pos = 0;
-    strcpy_s(tmp, sizeof(tmp), "");
-    pos += format_float_two_decimals(&tmp[pos], fps);                    // [9.1] Wartość FPS
+    pos += format_float_two_decimals(&tmp[pos], fps);
     strcpy_s(&tmp[pos], sizeof(tmp) - pos, " FPS");
     graphics_draw_text(disp, start_x, y, tmp);
     y += line_height;
 
-    // [10] Ilość wolnej pamięci RAM
+    /* [11] Free RAM (bytes) */
     pos = 0;
-    strcpy_s(tmp, sizeof(tmp), "");
-    pos += int_to_dec(&tmp[pos], free_ram);                              // [10.1] Wartość w bajtach
+    pos += int_to_dec(&tmp[pos], free_ram);
     strcpy_s(&tmp[pos], sizeof(tmp) - pos, " bytes free RAM");
+    graphics_draw_text(disp, start_x, y, tmp);
+    y += line_height;
+
+    /* [12] Application uptime (hh:mm:ss) */
+    unsigned int hours = uptime_sec / 3600;
+    unsigned int minutes = (uptime_sec % 3600) / 60;
+    unsigned int seconds = uptime_sec % 60;
+    pos = 0;
+    strcpy_s(tmp, sizeof(tmp), "Uptime: ");
+    pos = tiny_strlen(tmp);
+    pos += append_uint_zero_pad(&tmp[pos], hours, 2);
+    tmp[pos++] = ':';
+    pos += append_uint_zero_pad(&tmp[pos], minutes, 2);
+    tmp[pos++] = ':';
+    pos += append_uint_zero_pad(&tmp[pos], seconds, 2);
+    tmp[pos] = '\0';
     graphics_draw_text(disp, start_x, y, tmp);
 }

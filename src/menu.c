@@ -1,8 +1,6 @@
 #include "menu.h"
 
-/* ============================================================
- * (1) STAŁA LISTA ROZDZIELCZOŚCI
- * ============================================================ */
+/* [2] Constant list of available resolutions. */
 static const resolution_entry_t resolution_list[] = {
     { "PAL 640x288p",     &PAL_640x288p },
     { "NTSC 640x240p",    &NTSC_640x240p },
@@ -57,18 +55,14 @@ static const resolution_entry_t resolution_list[] = {
 
 static const int resolution_count = (int)(sizeof(resolution_list) / sizeof(resolution_list[0]));
 
-/* ============================================================
- * (2) ZMIENNE STANU MENU
- * ============================================================ */
+/* [3] Menu state variables. */
 static bool menu_running = false;
 static int menu_selected = 0;
 static int menu_scroll = 0;
 static int repeat_up_counter = 0;
 static int repeat_down_counter = 0;
 
-/* ============================================================
- * (3) FUNKCJE OBSŁUGI MENU
- * ============================================================ */
+/* [4] Menu control functions. */
 void menu_open(void) {
     menu_running = true;
     menu_selected = 0;
@@ -95,9 +89,7 @@ void menu_set_initial_resolution(const resolution_t *r) {
     }
 }
 
-/* ============================================================
- * (4) GŁÓWNA FUNKCJA OBSŁUGI MENU
- * ============================================================ */
+/* [5] Main menu update and drawing function. */
 menu_status_t menu_update(surface_t *disp, joypad_buttons_t pressed,
                           joypad_buttons_t held, const resolution_t **out_selected) {
     if (!menu_running) {
@@ -109,8 +101,6 @@ menu_status_t menu_update(surface_t *disp, joypad_buttons_t pressed,
         if (out_selected) *out_selected = NULL;
         return MENU_STATUS_CANCEL;
     }
-
-    /* (1) obliczenia pozycji i rozmiarów */
     int screen_w = disp->width;
     int screen_h = disp->height;
     int box_w = MENU_BOX_W_DEFAULT; if (box_w > screen_w - 20) box_w = screen_w - 20;
@@ -125,8 +115,6 @@ menu_status_t menu_update(surface_t *disp, joypad_buttons_t pressed,
     int avail_h = box_h - pad_y*2 - title_h - hint_h;
     if (avail_h < line_h) avail_h = line_h;
     int visible_lines = avail_h / line_h;
-
-    /* (2) obsługa nawigacji */
     if (pressed.d_up) {
         menu_selected--; repeat_up_counter = 0;
     } else if (pressed.d_down) {
@@ -147,45 +135,32 @@ menu_status_t menu_update(surface_t *disp, joypad_buttons_t pressed,
             }
         } else repeat_down_counter = 0;
     }
-
-    /* (3) zawijanie indeksu */
     if (menu_selected < 0) menu_selected = resolution_count - 1;
     if (menu_selected >= resolution_count) menu_selected = 0;
-
-    /* (4) przewijanie listy */
     if (menu_selected < menu_scroll) menu_scroll = menu_selected;
     if (menu_selected >= menu_scroll + visible_lines) menu_scroll = menu_selected - visible_lines + 1;
-
-    /* (5) potwierdzenie */
     if (pressed.a) {
         menu_running = false;
         if (out_selected) *out_selected = resolution_list[menu_selected].res;
         return MENU_STATUS_SELECTED;
     }
-
-    /* (6) anulowanie */
     if (pressed.b || pressed.start) {
         menu_running = false;
         if (out_selected) *out_selected = NULL;
         return MENU_STATUS_CANCEL;
     }
-
-    /* (7) kolory i rysowanie */
     uint32_t col_frame = graphics_make_color(0,200,0,255);
     uint32_t col_box_bg = graphics_make_color(24,24,24,200);
     uint32_t col_text = graphics_make_color(255,255,255,255);
     uint32_t col_text_dim = graphics_make_color(180,180,180,255);
     uint32_t col_highlight = graphics_make_color(200,200,0,255);
-
     graphics_draw_box(disp, box_x, box_y, box_w, box_h, col_box_bg);
     graphics_draw_line(disp, box_x - 2, box_y - 2, box_x + box_w + 1, box_y - 2, col_frame);
     graphics_draw_line(disp, box_x - 2, box_y + box_h + 1, box_x + box_w + 1, box_y + box_h + 1, col_frame);
     graphics_draw_line(disp, box_x - 2, box_y - 2, box_x - 2, box_y + box_h + 1, col_frame);
     graphics_draw_line(disp, box_x + box_w + 1, box_y - 2, box_x + box_w + 1, box_y + box_h + 1, col_frame);
-
     graphics_set_color(col_text, 0);
-    graphics_draw_text(disp, box_x + pad_x, box_y + pad_y, "Wybierz rozdzielczosc:");
-
+    graphics_draw_text(disp, box_x + pad_x, box_y + pad_y, "Select resolution:");
     int y = box_y + pad_y + title_h;
     for (int i = 0; i < visible_lines; ++i) {
         int idx = menu_scroll + i;
@@ -206,11 +181,9 @@ menu_status_t menu_update(surface_t *disp, joypad_buttons_t pressed,
         graphics_draw_text(disp, box_x + pad_x, y, tmp);
         y += line_h;
     }
-
     graphics_set_color(col_text_dim, 0);
     graphics_draw_text(disp, box_x + pad_x, box_y + box_h - hint_h + 2,
-                       "A = OK  ENTER/B = Anuluj  D-UP/DOWN");
-
+                       "A = OK  ENTER/B = Cancel  D-UP/DOWN");
     if (out_selected) *out_selected = NULL;
     return MENU_STATUS_OPEN;
 }
