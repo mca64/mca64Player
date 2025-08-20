@@ -18,6 +18,7 @@ int int_to_dec(char *out, int value);                      /* Convert int to dec
 int append_uint_zero_pad(char *dst, unsigned int value, int width); /* Unsigned int to zero-padded string */
 int format_float_two_decimals(char *out, double val);      /* Format double with two decimals */
 int format_float_one_decimal(char *out, float val);        /* Format float with one decimal */
+int int_to_hex(char *out, uint32_t value, int width);      /* Convert int to hex string with fixed width */
 
 /* [4] Safe append */
 int safe_append_str(char *dst, int dst_size, int pos, const char *src); /* Append string at position */

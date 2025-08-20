@@ -33,6 +33,7 @@ void menu_open(void);
 void menu_close(void);
 bool menu_is_open(void);
 void menu_set_initial_resolution(const resolution_t *r);
+void menu_set_logo_sprite(sprite_t* logo);
 menu_status_t menu_update(surface_t *disp, joypad_buttons_t pressed,
                           joypad_buttons_t held, const resolution_t **out_selected);
 

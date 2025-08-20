@@ -132,12 +132,24 @@ int main(void) {
     char *hex_line2 = (char *)arena_alloc(40);
     char *perfbuf = (char *)arena_alloc(128);
     char *tmpbuf = (char *)arena_alloc(64);
-
+    /* [28.1] Load logo sprite (must be converted to .sprite and placed in romfs/logo.sprite) */
+    sprite_t* logo = sprite_load("rom:/logo.sprite");
+    if (logo) {
+        menu_set_logo_sprite(logo);
+    }
     /* [29] Variables for VU meter (audio peak levels) */
     int max_amp = 0, max_amp_l = 0, max_amp_r = 0;
 
     /* [30] --- Main application loop --- */
     while (1) {
+        double ram_total = get_memory_size() / (1024.0 * 1024.0);
+        struct mallinfo mi = mallinfo();
+        double used_malloc = (double)mi.uordblks;
+        double used_arena = (double)arena_get_used();
+        double used_total_mb = (used_malloc + used_arena) / (1024.0 * 1024.0);
+        double ram_free = ram_total - used_total_mb;
+        if (ram_free < 0.0) ram_free = 0.0;
+
         /* [31] Start of frame: measure time */
         float frame_start_ms = get_ticks_ms();
         float frame_interval_ms = (last_frame_start_ms > 0.0f) ? (frame_start_ms - last_frame_start_ms) : (1000.0f / 60.0f);
@@ -215,6 +227,7 @@ int main(void) {
         graphics_set_color(white, 0);
         const char *title = "mca64Player";
         int title_x = ((int)display_get_width() - tiny_strlen(title) * 8) / 2;
+        graphics_draw_sprite(disp, 0, 0, logo);
         graphics_draw_text(disp, title_x, 4, title);
         graphics_draw_text(disp, 10, 4, last_button_pressed);
         graphics_draw_text(disp, 10, 16, analog_pos);
@@ -332,16 +345,7 @@ int main(void) {
             fps = TICKS_PER_SECOND / diff_ticks;
         }
         last_frame_ticks = now_ticks;
-        int cpu_avg_int = (int)(cpu_usage_get_avg() + 0.5f);
-        strcpy_s(perfbuf, 128, "CPU: ");
-        int p = tiny_strlen(perfbuf);
-        p += int_to_dec(&perfbuf[p], cpu_avg_int);
-        perfbuf[p++] = '%';
-        perfbuf[p++] = ' ';
-        format_float_two_decimals(&perfbuf[p], (double)last_cpu_ms_display);
-        p = tiny_strlen(perfbuf);
-        strcpy_s(&perfbuf[p], 128 - p, "ms");
-        graphics_draw_text(disp, 180, 16, perfbuf);
+
         if (smoothed_fps <= 0.0f) smoothed_fps = (float)fps;
         else smoothed_fps = (1.0f - FRAME_MS_ALPHA) * smoothed_fps + FRAME_MS_ALPHA * (float)fps;
         strcpy_s(perfbuf, 128, "FPS: ");
@@ -350,13 +354,6 @@ int main(void) {
         graphics_draw_text(disp, 10, 230, perfbuf);
 
         /* [48] Draw RAM usage and free memory */
-        double ram_total = get_memory_size() / (1024.0 * 1024.0);
-        struct mallinfo mi = mallinfo();
-        double used_malloc = (double)mi.uordblks;
-        double used_arena = (double)arena_get_used();
-        double used_total_mb = (used_malloc + used_arena) / (1024.0 * 1024.0);
-        double ram_free = ram_total - used_total_mb;
-        if (ram_free < 0.0) ram_free = 0.0;
         strcpy_s(perfbuf, 128, "RAM: ");
         format_float_two_decimals(&perfbuf[tiny_strlen(perfbuf)], ram_total);
         off = tiny_strlen(perfbuf);
@@ -503,7 +500,11 @@ int main(void) {
            smoothed_fps,
            (int)(ram_free * 1024.0 * 1024.0),
            320, 12,
-           uptime_sec);
+           uptime_sec,
+           ram_total,
+           &sound,
+           header_hex_string);
+
         display_show(disp);
 
         /* [53] End of frame: measure and update CPU/frame stats */

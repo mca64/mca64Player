@@ -1,4 +1,5 @@
 #include "menu.h"
+#include <libdragon.h>
 
 /* [2] Constant list of available resolutions. */
 static const resolution_entry_t resolution_list[] = {
@@ -61,6 +62,7 @@ static int menu_selected = 0;
 static int menu_scroll = 0;
 static int repeat_up_counter = 0;
 static int repeat_down_counter = 0;
+static sprite_t* menu_logo = NULL;
 
 /* [4] Menu control functions. */
 void menu_open(void) {
@@ -87,6 +89,10 @@ void menu_set_initial_resolution(const resolution_t *r) {
             return;
         }
     }
+}
+
+void menu_set_logo_sprite(sprite_t* logo) {
+    menu_logo = logo;
 }
 
 /* [5] Main menu update and drawing function. */
@@ -159,6 +165,12 @@ menu_status_t menu_update(surface_t *disp, joypad_buttons_t pressed,
     graphics_draw_line(disp, box_x - 2, box_y + box_h + 1, box_x + box_w + 1, box_y + box_h + 1, col_frame);
     graphics_draw_line(disp, box_x - 2, box_y - 2, box_x - 2, box_y + box_h + 1, col_frame);
     graphics_draw_line(disp, box_x + box_w + 1, box_y - 2, box_x + box_w + 1, box_y + box_h + 1, col_frame);
+    // Draw logo sprite in menu if available, before any text
+    if (menu_logo) {
+        int logo_x = box_x + box_w - menu_logo->width - 8;
+        int logo_y = box_y + 8;
+        graphics_draw_sprite(disp, logo_x, logo_y, menu_logo);
+    }
     graphics_set_color(col_text, 0);
     graphics_draw_text(disp, box_x + pad_x, box_y + pad_y, "Select resolution:");
     int y = box_y + pad_y + title_h;

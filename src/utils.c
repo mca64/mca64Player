@@ -131,3 +131,14 @@ void u8_to_hex_sp(char *out, uint8_t v) {
     out[1] = hex[v & 0xF];
     out[2] = ' ';
 }
+
+/** [5.2] int_to_hex: Converts an integer to a hex string with fixed width (no prefix). Returns number of chars written. */
+int int_to_hex(char *out, uint32_t value, int width) {
+    static const char hex[] = "0123456789ABCDEF";
+    int pos = 0;
+    for (int i = width - 1; i >= 0; --i) {
+        out[pos++] = hex[(value >> (i * 4)) & 0xF];
+    }
+    out[pos] = '\0';
+    return pos;
+}

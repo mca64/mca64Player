@@ -8,7 +8,7 @@ ROMFS_IMAGE = $(BUILD_DIR)/romfs.dfs
 
 # [2] Source files and assets
 OBJS = $(BUILD_DIR)/main.o $(BUILD_DIR)/utils.o $(BUILD_DIR)/debug.o $(BUILD_DIR)/menu.o $(BUILD_DIR)/arena.o $(BUILD_DIR)/cpu_usage.o $(BUILD_DIR)/vu.o $(BUILD_DIR)/hud.o
-ASSETS = $(ROMFS_DIR)/sound.wav64
+ASSETS = $(ROMFS_DIR)/sound.wav64 $(ROMFS_DIR)/logo.sprite
 
 # [3] ROM title
 N64_ROM_TITLE = "mca64Player"
