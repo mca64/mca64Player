@@ -1,27 +1,30 @@
-# mca64Player (NowyN)
+# mca64Player
+<img width="1282" height="1036" alt="BezÂ tytuÅ‚u" src="https://github.com/user-attachments/assets/5423642e-e2ae-40ef-bb9f-5b98c8178b65" />
 
-Odtwarzacz plików WAV64 na Nintendo 64, oparty o libdragon.
+<img width="1282" height="1036" alt="BezÂ tytuÅ‚u2" src="https://github.com/user-attachments/assets/5750aeef-7b29-425b-b013-017f01dcf2f0" />
+
+Odtwarzacz plikÃ³w WAV64 na Nintendo 64, oparty o libdragon.
 
 ## Funkcje
 
-- Odtwarzanie plików WAV64 z obs³ug¹ PCM, VADPCM, Opus
-- Wybór rozdzielczoœci ekranu (PAL/NTSC, progresywne/interlaced, profile z gier)
-- HUD z informacjami o pliku, czasie, bitrate, liczbie kana³ów, g³oœnoœci
-- Mierniki VU (poziomów audio)
-- Mierniki wydajnoœci: FPS, CPU, RAM
+- Odtwarzanie plikÃ³w WAV64 z obsÅ‚ugÄ… PCM, VADPCM, Opus
+- WybÃ³r rozdzielczoÅ›ci ekranu (PAL/NTSC, progresywne/interlaced, profile z gier)
+- HUD z informacjami o pliku, czasie, bitrate, liczbie kanaÅ‚Ã³w, gÅ‚oÅ›noÅ›ci
+- Mierniki VU (poziomÃ³w audio)
+- Mierniki wydajnoÅ›ci: FPS, CPU, RAM
 - System menu sterowany padem N64
-- Obs³uga pêtli, przewijania, pauzy, regulacji g³oœnoœci
+- ObsÅ‚uga pÄ™tli, przewijania, pauzy, regulacji gÅ‚oÅ›noÅ›ci
 
 ## Struktura projektu
 
-- `src/` — kod Ÿród³owy (C, nag³ówki)
-- `romfs/` — pliki do³¹czane do obrazu ROM (np. sound.wav64)
-- `Makefile` — budowanie projektu (wymaga libdragon)
+- `src/` â€” kod ÅºrÃ³dÅ‚owy (C, nagÅ‚Ã³wki)
+- `romfs/` â€” pliki doÅ‚Ä…czane do obrazu ROM (np. sound.wav64)
+- `Makefile` â€” budowanie projektu (wymaga libdragon)
 
 ## Budowanie
 
-1. Skonfiguruj œrodowisko libdragon (`N64_INST` musi byæ ustawione)
-2. Umieœæ plik WAV64 w `romfs/sound.wav64`
+1. Skonfiguruj Å›rodowisko libdragon (`N64_INST` musi byÄ‡ ustawione)
+2. UmieÅ›Ä‡ plik WAV64 w `romfs/sound.wav64`
 3. Uruchom:
 
    ```sh
@@ -32,11 +35,11 @@ Odtwarzacz plików WAV64 na Nintendo 64, oparty o libdragon.
 
 ## Sterowanie (N64 pad)
 
-- **A** — pauza/wznowienie
-- **B** — stop
-- **START** — menu rozdzielczoœci
-- **L/R/D-Pad/C-Buttons** — przewijanie, regulacja g³oœnoœci
-- **Z** — w³¹cz/wy³¹cz pêtlê
+- **A** â€” pauza/wznowienie
+- **B** â€” stop
+- **START** â€” menu rozdzielczoÅ›ci
+- **L/R/D-Pad/C-Buttons** â€” przewijanie, regulacja gÅ‚oÅ›noÅ›ci
+- **Z** â€” wÅ‚Ä…cz/wyÅ‚Ä…cz pÄ™tlÄ™
 
 ## Wymagania
 
