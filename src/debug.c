@@ -6,7 +6,6 @@
 void debug_info(surface_t *disp, int sample_rate, float frame_ms, float cpu_percent,
                 float fps, int free_ram, int start_x, int start_y, unsigned int uptime_sec, double ram_total_mb, const wav64_t* wav,
                 const char* wav64_header_hex, uint8_t compression_level) {
-    int can_write = audio_can_write();
     int buf_len = audio_get_buffer_length();
     float buf_ms = (float)buf_len / (float)sample_rate * 1000.0f;
     graphics_set_color(graphics_make_color(255, 255, 0, 255), 0);

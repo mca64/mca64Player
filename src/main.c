@@ -14,7 +14,7 @@
 #include "cpu_usage.h" /* [14] CPU usage averaging header */
 #include "vu.h"        /* [15] VU meter logic header */
 #include "hud.h"       /* [16] HUD/message display header */
-
+#include <debug.h>
 /* [17] Application-wide constants */
 #define SCREEN_W 640     /* Default screen width */
 #define SCREEN_H 288     /* Default screen height */
@@ -36,6 +36,11 @@ static const resolution_t *current_resolution = NULL; /* Current selected resolu
 
 /* [19] Main program entry point */
 int main(void) {
+
+    debug_init(DEBUG_FEATURE_ALL); // logi w Ares
+    int x = 640;
+    debugf("Wartoœæ zmiennej x = %d\n", x);
+
     /* [20] --- Initialization section --- */
     const int SOUND_CH = 0; /* Audio channel index */
     static const resolution_t PAL = {SCREEN_W, SCREEN_H, false}; /* Default PAL resolution */
@@ -132,10 +137,9 @@ int main(void) {
     }
     /* [29] Variables for VU meter (audio peak levels) */
     int max_amp = 0, max_amp_l = 0, max_amp_r = 0;
-
+    double ram_total = get_memory_size() / (1024.0 * 1024.0);
     /* [30] --- Main application loop --- */
     while (1) {
-        double ram_total = get_memory_size() / (1024.0 * 1024.0);
         struct mallinfo mi = mallinfo();
         double used_malloc = (double)mi.uordblks;
         double used_arena = (double)arena_get_used();
@@ -220,7 +224,10 @@ int main(void) {
         graphics_set_color(white, 0);
         const char *title = "mca64Player";
         int title_x = ((int)display_get_width() - tiny_strlen(title) * 8) / 2;
-        graphics_draw_sprite(disp, 0, 0, logo);
+        graphics_draw_sprite(disp, 100, 100, logo);
+        debugf("=== Sprite metadata ===");
+        debugf(" w=%u h=%u hslices=%u vslices=%u", logo->width, logo->height, logo->hslices, logo->vslices);
+        debugf(" format=%d fits_tmem=%d pal=%p", (int)sprite_get_format(logo), sprite_fits_tmem(logo) ? 1 : 0, sprite_get_palette(logo));
         graphics_draw_text(disp, title_x, 4, title);
         graphics_draw_text(disp, 10, 4, last_button_pressed);
         graphics_draw_text(disp, 10, 16, analog_pos);
@@ -248,8 +255,8 @@ int main(void) {
 
         /* [45] Draw VU meters (audio levels) */
         vu_update(frame_interval_ms, max_amp_l, max_amp_r);
-        int vu_base_x = 280;
-        int vu_base_y = 200;
+        int vu_base_x = 12;
+        int vu_base_y = 110;
         int vu_width = 8;
         int vu_height = 40;
         int draw_vu_l = vu_get_left();
