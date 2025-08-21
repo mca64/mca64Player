@@ -56,7 +56,8 @@ int main(void) {
     }
 
     /* [22] Read WAV64 file header and extract compression info */
-    uint8_t manual_compression_level = 0;
+    // compression_level is read from the WAV64 file header (header_buf[5])
+    uint8_t compression_level = 0;
     char header_hex_string[64]; header_hex_string[0] = '\0';
     int dfs_bytes_read = -1;
     char header_buf[16];
@@ -64,7 +65,7 @@ int main(void) {
     FILE *f = asset_fopen("rom:/sound.wav64", &file_size);
     if (f) {
         dfs_bytes_read = (int)fread(header_buf, 1, (size_t)sizeof(header_buf), f);
-        if (dfs_bytes_read >= 6) manual_compression_level = (uint8_t)header_buf[5];
+        if (dfs_bytes_read >= 6) compression_level = (uint8_t)header_buf[5];
         int ptr = 0;
         for (int i = 0; i < dfs_bytes_read && (ptr + 3) < (int)sizeof(header_hex_string); i++) {
             u8_to_hex_sp(&header_hex_string[ptr], (uint8_t)header_buf[i]);
@@ -81,7 +82,6 @@ int main(void) {
     last_frame_ticks = timer_ticks();
 
     /* [24] Set up audio compression type */
-    int compression_level = (int)manual_compression_level;
     if (compression_level != 0 && compression_level != 1 && compression_level != 3) compression_level = 0;
     wav64_init_compression(compression_level);
 
@@ -108,13 +108,9 @@ int main(void) {
     uint32_t sample_rate = (uint32_t)(sound.wave.frequency + 0.5f);
     uint8_t channels = sound.wave.channels;
     uint32_t total_samples = (uint32_t)sound.wave.len;
-    uint8_t bits_per_sample = sound.wave.bits;
     uint32_t total_seconds = (sample_rate && total_samples) ? (uint32_t)(total_samples / sample_rate) : 0;
     uint32_t total_minutes = total_seconds / 60;
     uint32_t total_secs_rem = total_seconds % 60;
-    int bitrate_bps = wav64_get_bitrate(&sound);
-    uint32_t bitrate_kbps = (bitrate_bps > 0) ? (uint32_t)(bitrate_bps / 1000) :
-                         (uint32_t)((sample_rate * (uint32_t)channels * (uint32_t)bits_per_sample) / 1000U);
 
     /* [28] Allocate temporary buffers from arena for UI and state */
     char *last_button_pressed = (char *)arena_alloc(32);
@@ -128,9 +124,6 @@ int main(void) {
     uint32_t box_bg_color = graphics_make_color(0, 200, 0, 255);
     bool loop_enabled = true;
     char *linebuf = (char *)arena_alloc(256);
-    char *hex_line1 = (char *)arena_alloc(40);
-    char *hex_line2 = (char *)arena_alloc(40);
-    char *perfbuf = (char *)arena_alloc(128);
     char *tmpbuf = (char *)arena_alloc(64);
     /* [28.1] Load logo sprite (must be converted to .sprite and placed in romfs/logo.sprite) */
     sprite_t* logo = sprite_load("rom:/logo.sprite");
@@ -253,60 +246,6 @@ int main(void) {
             graphics_draw_box(disp, bar_x, bar_y, pw, bar_h, green);
         }
 
-        /* [41] Draw audio parameters (sample rate, bitrate, channels, bits) */
-        strcpy_s(linebuf, 128, "Sample rate: ");
-        off = tiny_strlen(linebuf);
-        off += int_to_dec(&linebuf[off], (int)sample_rate);
-        strcpy_s(&linebuf[off], 128 - off, " Hz");
-        graphics_draw_text(disp, 10, 76, linebuf);
-        strcpy_s(linebuf, 128, "Bitrate: ");
-        off = tiny_strlen(linebuf);
-        off += int_to_dec(&linebuf[off], (int)bitrate_kbps);
-        strcpy_s(&linebuf[off], 128 - off, " kbps");
-        graphics_draw_text(disp, 10, 94, linebuf);
-        if (channels == 1) strcpy_s(linebuf, 128, "Channels: Mono (1)");
-        else strcpy_s(linebuf, 128, "Channels: Stereo (2)");
-        graphics_draw_text(disp, 10, 112, linebuf);
-        strcpy_s(linebuf, 128, "Bits: ");
-        off = tiny_strlen(linebuf);
-        off += int_to_dec(&linebuf[off], (int)bits_per_sample);
-        strcpy_s(&linebuf[off], 128 - off, " bit");
-        graphics_draw_text(disp, 10, 130, linebuf);
-
-        /* [42] Draw resolution info */
-        if (current_resolution) {
-            strcpy_s(linebuf, 128, "Resolution: ");
-            off = tiny_strlen(linebuf);
-            off += int_to_dec(&linebuf[off], (int)current_resolution->width);
-            linebuf[off++] = 'x';
-            off += int_to_dec(&linebuf[off], (int)current_resolution->height);
-            linebuf[off++] = current_resolution->interlaced ? 'i' : 'p';
-            linebuf[off] = '\0';
-        } else {
-            strcpy_s(linebuf, 128, "Resolution: ");
-            off = tiny_strlen(linebuf);
-            off += int_to_dec(&linebuf[off], display_get_width());
-            linebuf[off++] = 'x';
-            off += int_to_dec(&linebuf[off], display_get_height());
-            linebuf[off] = '\0';
-        }
-        graphics_draw_text(disp, 10, 148, linebuf);
-
-        /* [43] Draw compression info */
-        strcpy_s(linebuf, 128, "Compression: ");
-        off = tiny_strlen(linebuf);
-        if (manual_compression_level == 0) strcpy_s(&linebuf[off], 128 - off, "PCM");
-        else if (manual_compression_level == 1) strcpy_s(&linebuf[off], 128 - off, "VADPCM");
-        else if (manual_compression_level == 3) strcpy_s(&linebuf[off], 128 - off, "Opus");
-        else { off += int_to_dec(&linebuf[off], (int)manual_compression_level); }
-        graphics_draw_text(disp, 10, 166, linebuf);
-
-        /* [44] Draw total sample count */
-        strcpy_s(linebuf, 128, "Samples: ");
-        off = tiny_strlen(linebuf);
-        off += int_to_dec(&linebuf[off], (int)total_samples);
-        graphics_draw_text(disp, 10, 184, linebuf);
-
         /* [45] Draw VU meters (audio levels) */
         vu_update(frame_interval_ms, max_amp_l, max_amp_r);
         int vu_base_x = 280;
@@ -324,21 +263,7 @@ int main(void) {
             draw_vu_meter(disp, vu_base_x + 8, vu_base_y, vu_width, vu_height, mono_v, 32768, white, green, "Mono");
         }
 
-        /* [46] Draw WAV64 header hex dump (split into two lines) */
-        int hex_len = tiny_strlen(header_hex_string);
-        int groups = hex_len / 3;
-        int split_groups = groups / 2;
-        int split_pos = split_groups * 3;
-        int i = 0, idx = 0;
-        for (i = 0; i < split_pos && i < (int)40 - 1; i++) hex_line1[i] = header_hex_string[i];
-        hex_line1[i] = '\0';
-        idx = 0;
-        for (i = split_pos; i < hex_len && idx < (int)40 - 1; i++) hex_line2[idx++] = header_hex_string[i];
-        hex_line2[idx] = '\0';
-        graphics_draw_text(disp, 10, 202, hex_line1);
-        graphics_draw_text(disp, 10, 212, hex_line2);
-
-        /* [47] Update FPS and CPU usage meters */
+        /* [46] Update FPS and CPU usage meters */
         uint32_t now_ticks = timer_ticks();
         uint32_t diff_ticks = now_ticks - last_frame_ticks;
         if (last_frame_ticks != 0 && diff_ticks > 0) {
@@ -348,22 +273,8 @@ int main(void) {
 
         if (smoothed_fps <= 0.0f) smoothed_fps = (float)fps;
         else smoothed_fps = (1.0f - FRAME_MS_ALPHA) * smoothed_fps + FRAME_MS_ALPHA * (float)fps;
-        strcpy_s(perfbuf, 128, "FPS: ");
-        off = tiny_strlen(perfbuf);
-        off += int_to_dec(&perfbuf[off], (int)(smoothed_fps + 0.5f));
-        graphics_draw_text(disp, 10, 230, perfbuf);
 
-        /* [48] Draw RAM usage and free memory */
-        strcpy_s(perfbuf, 128, "RAM: ");
-        format_float_two_decimals(&perfbuf[tiny_strlen(perfbuf)], ram_total);
-        off = tiny_strlen(perfbuf);
-        strcpy_s(&perfbuf[off], 128 - off, " MB");
-        graphics_draw_text(disp, 74, 230, perfbuf);
-        strcpy_s(perfbuf, 128, "Free: ");
-        format_float_two_decimals(&perfbuf[tiny_strlen(perfbuf)], ram_free);
-        off = tiny_strlen(perfbuf);
-        strcpy_s(&perfbuf[off], 128 - off, " MB");
-        graphics_draw_text(disp, 200, 230, perfbuf);
+
 
         /* [49] Handle menu opening (START button) */
         if (pressed.start && !menu_is_open()) {
@@ -499,11 +410,12 @@ int main(void) {
            cpu_usage_get_avg(),
            smoothed_fps,
            (int)(ram_free * 1024.0 * 1024.0),
-           320, 12,
+           312, 12,
            uptime_sec,
            ram_total,
            &sound,
-           header_hex_string);
+           header_hex_string,
+           compression_level);
 
         display_show(disp);
 
